@@ -1,0 +1,244 @@
+# -*- coding: utf-8 -*-
+"""
+@author: morison.su
+
+本程式利用Google gemini LLM API 進行文本整理，請自行更改LLM API and API Key
+"""
+
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
+from sentence_transformers import SentenceTransformer
+import google.generativeai as genai
+from collections import deque # 引入 deque 用於 BFS
+
+# --- Gemini API 配置 ---
+try:
+    # 這裡假設 GOOGLE_API_KEY 已在環境變數中設置
+    my_api_key = "" # 這是你從 Google AI Studio 取得的 API 金鑰
+
+    genai.configure(api_key=my_api_key)
+    # 測試是否能成功初始化模型，如果不能，會捕獲異常
+    _ = genai.GenerativeModel('gemini-2.5-pro') 
+    gemini_configured = True
+except Exception as e:
+    print(f"警告：無法從環境變數獲取 GOOGLE_API_KEY 或 Gemini 配置失敗。")
+    print(f"錯誤信息: {e}")
+    print("將無法執行 Super Chunk 的 LLM 整理步驟。")
+    gemini_configured = False
+    
+# 初始化 Gemini 模型 (只有在配置成功時)
+if gemini_configured:
+    model = genai.GenerativeModel('gemini-2.5-pro')
+else:
+    model = None # 如果配置失敗，模型設置為 None
+
+# --- 載入 SentenceTransformer 模型 (保持不變) ---
+try:
+    embedding_model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
+    print("SentenceTransformer 嵌入模型加載成功。")
+    embedding_model_loaded = True
+except Exception as e:
+    print(f"錯誤：無法加載 SentenceTransformer 嵌入模型: {e}")
+    print("請確保您已安裝 'sentence-transformers' 庫，並檢查網路連接。")
+    print("將無法執行語義相似度聚合。")
+    embedding_model_loaded = False
+    embedding_model = None
+
+# 一篇較長的中文文章範例 (保持不變)
+long_chinese_text = """
+人工智能（AI）正在迅速改變我們的生活和工作方式。從智能手機中的語音助手到自動駕駛汽車，AI 的應用無處不在。AI 的核心目標是使機器能夠像人類一樣思考、學習和解決問題。
+
+機器學習是AI的一個重要分支，它使計算機系統能夠從數據中學習而無需明確編程。深度學習是機器學習的子領域，它利用人工神經網絡，特別是多層次網絡，來處理複雜模式識別任務，例如圖像識別和自然語言處理。
+
+自然語言處理（NLP）是AI的另一個關鍵領域，它專注於讓計算機理解、解釋和生成人類語言。語音識別、機器翻譯和情感分析都是NLP的應用。透過NLP，我們可以與計算機進行更自然的互動。
+
+雖然AI帶來了巨大的潛力，但也伴隨著一些挑戰，例如倫理問題、隱私問題以及對就業市場的影響。如何平衡AI的發展與社會責任是我們需要共同面對的課題。未來，AI將繼續深入發展，影響我們生活的方方面面。
+"""
+print("--- 原始長篇中文文章 ---")
+print(long_chinese_text)
+print("-" * 30)
+
+# --- 基礎重疊切塊函數 (無變動) ---
+def chunk_text_with_overlap(text: str, chunk_size: int, overlap_size: int) -> list[dict]:
+    chunks = []
+    text_length = len(text)
+    start_index = 0
+    chunk_id_counter = 0
+
+    while start_index < text_length:
+        end_index = min(start_index + chunk_size, text_length)
+        chunk_content = text[start_index:end_index]
+        chunks.append({"id": f"base_chunk_{chunk_id_counter}", "content": chunk_content})
+        chunk_id_counter += 1
+
+        if end_index == text_length:
+            break
+
+        start_index += (chunk_size - overlap_size)
+        start_index = min(start_index, text_length - 1)
+        
+    return chunks
+
+# --- 獲取嵌入向量 (無變動) ---
+def get_real_embeddings(texts: list[str], model) -> np.ndarray:
+    if model is None:
+        raise ValueError("嵌入模型未加載或初始化失敗，無法生成嵌入。")
+        
+    embeddings = model.encode(texts, convert_to_numpy=True)
+    return embeddings
+
+# --- 核心修改：基於 BFS 的聚合函數 ---
+def aggregate_chunks_by_similarity_bfs(
+    base_chunks: list[dict],
+    embedding_model,
+    similarity_threshold: float
+) -> list[dict]:
+    """
+    使用基於餘弦相似度的 BFS，將所有相似的基礎文字塊分組。
+    透過構建圖形並找到連通分量來實現聚合。
+    """
+    if not base_chunks:
+        return []
+        
+    if not embedding_model_loaded:
+        print("警告：嵌入模型未加載，無法執行語義相似度聚合。")
+        return []
+
+    base_chunk_contents = [chunk['content'] for chunk in base_chunks]
+    
+    print("正在生成真實嵌入... (這可能需要一些時間)")
+    base_chunk_embeddings = get_real_embeddings(base_chunk_contents, embedding_model)
+    print("真實嵌入生成完成。")
+    
+    num_chunks = len(base_chunks)
+    
+    # 建立圖形：鄰接列表
+    # 如果兩個區塊的餘弦相似度高於閾值，則它們之間有一條邊
+    adj_list = [[] for _ in range(num_chunks)]
+    
+    # 計算所有區塊對之間的相似度並建立邊
+    # 這裡使用雙迴圈，對於大規模數據可以考慮使用近似最近鄰 (ANN) 演算法來加速
+    print("正在建立相似度圖形...")
+    for i in range(num_chunks):
+        for j in range(i + 1, num_chunks):
+            # 計算餘弦相似度
+            # reshape(-1, 1) 是為了讓 cosine_similarity 接受單個向量
+            similarity = cosine_similarity(
+                base_chunk_embeddings[i].reshape(1, -1),
+                base_chunk_embeddings[j].reshape(1, -1)
+            )[0][0]
+            
+            if similarity >= similarity_threshold:
+                adj_list[i].append(j)
+                adj_list[j].append(i) # 無向圖
+    print("相似度圖形建立完成。")
+
+    visited = [False] * num_chunks
+    aggregated_chunks = []
+    super_chunk_id_counter = 0
+
+    # 遍歷所有區塊，尋找連通分量 (使用 BFS)
+    for i in range(num_chunks):
+        if not visited[i]:
+            current_cluster_indices = []
+            queue = deque([i])
+            visited[i] = True
+            
+            while queue:
+                node_idx = queue.popleft()
+                current_cluster_indices.append(node_idx)
+                
+                for neighbor_idx in adj_list[node_idx]:
+                    if not visited[neighbor_idx]:
+                        visited[neighbor_idx] = True
+                        queue.append(neighbor_idx)
+            
+            # 將連通分量中的基礎區塊組合成一個 Super Chunk
+            if len(current_cluster_indices) > 1: # 只聚合包含多個區塊的聚類
+                # 根據原始索引排序，以保持原始文本的順序
+                current_cluster_indices.sort()
+                
+                chunk_group = [base_chunks[idx] for idx in current_cluster_indices]
+                content = "".join([chunk['content'] for chunk in chunk_group])
+                original_ids = [chunk['id'] for chunk in chunk_group]
+                
+                aggregated_chunks.append({
+                    "id": f"super_chunk_{super_chunk_id_counter}",
+                    "content": content,
+                    "original_chunk_ids": original_ids
+                })
+                super_chunk_id_counter += 1
+            elif len(current_cluster_indices) == 1:
+                # 如果只有一個區塊，且沒有與其他區塊相似，則它自己就是一個 "super chunk"
+                # 這裡的邏輯與原先的 Hierarchical Clustering 相同，只聚合多個區塊的聚類
+                # 如果您希望單獨的區塊也作為 super chunk 輸出，可以移除這個 if 判斷
+                pass
+                
+    return aggregated_chunks
+
+# --- 使用 LLM 整理函數 (無變動) ---
+def summarize_or_refine_super_chunk(super_chunk_content: str, model) -> str:
+    prompt = f"""請精煉並整理以下文本內容，去除冗餘多餘詞彙與空格，使其更流暢和精確，同時保持所有原始關鍵資訊。
+    
+    文本內容:
+    {super_chunk_content}
+    
+    精煉後的文本:
+    """
+    try:
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        print(f"LLM 整理 Super Chunk 失敗: {e}")
+        return super_chunk_content
+        
+# --- 運行主程式 ---
+CHUNK_SIZE = 60
+OVERLAP_SIZE = 15
+SIMILARITY_THRESHOLD = 0.8 # 相似度閾值，0.5 表示 50% 相似
+
+print(f"\n--- 步驟 1: 基礎重疊切塊 (區塊大小: {CHUNK_SIZE}, 重疊大小: {OVERLAP_SIZE}) ---")
+base_chunks = chunk_text_with_overlap(long_chinese_text, CHUNK_SIZE, OVERLAP_SIZE)
+
+for i, chunk in enumerate(base_chunks):
+    print(f"基礎區塊 {chunk['id']} (長度: {len(chunk['content'])} 字元):")
+    print(chunk['content'])
+    print("-" * 20)
+
+print(f"\n--- 步驟 2 & 3: 基於餘弦距離的 BFS 語義相似度聚合 ---")
+print(f"  語義相似度閾值: {SIMILARITY_THRESHOLD}")
+
+contextual_super_chunks = []
+if embedding_model_loaded:
+    contextual_super_chunks = aggregate_chunks_by_similarity_bfs( # 呼叫新的 BFS 函數
+        base_chunks,
+        embedding_model,
+        SIMILARITY_THRESHOLD
+    )
+else:
+    print("跳過語義相似度聚合，因為嵌入模型加載失敗。")
+
+
+if not contextual_super_chunks:
+    print("沒有生成任何聚合大塊。請嘗試調整相似度閾值或基礎塊大小。")
+else:
+    for i, super_chunk in enumerate(contextual_super_chunks):
+        print(f"聚合大塊 {super_chunk['id']} (包含 {len(super_chunk['original_chunk_ids'])} 個基礎塊):")
+        print(f"  基礎塊 ID: {super_chunk['original_chunk_ids']}")
+        print(f"  內容 (原始拼接長度: {len(super_chunk['content'])} 字元):\n{super_chunk['content']}")
+        
+        # --- 步驟 4: 使用 LLM 整理 Super Chunk ---
+        if gemini_configured and model:
+            print("\n  正在使用 LLM 整理 Super Chunk 內容...")
+            refined_content = summarize_or_refine_super_chunk(super_chunk['content'], model)
+            print(f"  **LLM 整理後內容 (長度: {len(refined_content)} 字元):**\n{refined_content}")
+        else:
+            print("\n  **LLM 整理跳過：Gemini API 未配置或初始化失敗。**")
+        print("=" * 30)
+
+print("\n--- 總結 ---")
+print(f"原始文本長度: {len(long_chinese_text)} 字元")
+print(f"共生成 {len(base_chunks)} 個基礎文字塊。")
+print(f"共生成 {len(contextual_super_chunks)} 個聚合大塊。")
+print("原始基礎文字塊 (base_chunks) 仍然存在，可以根據需求用於檢索。")
+print("聚合大塊 (contextual_super_chunks) 經過 LLM 整理後，更適合作為提供上下文的單位。")
