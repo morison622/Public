@@ -4,7 +4,6 @@ import random
 from typing import List, Dict
 
 # 請將 YOUR_API_KEY_HERE 替換成你的 Google Gemini API Key
-# 務必保護好你的 API Key，不要分享給他人。
 GEMINI_API_KEY = "    "
 
 def get_gemini_response(prompt: str, api_key: str) -> str:
